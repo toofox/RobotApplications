@@ -1,0 +1,124 @@
+# Funktionen fuer das Programm "Pick and Place Version 5 (lesbar)"
+# Reihenfolge nicht aendern: die ersten drei werden von den anderen benutzt.
+
+# Position der Werkzeugspitze im Feature (Platte oder Schrank)
+def x_im_frame(frame):
+  local p_rel = pose_trans(pose_inv(frame), get_actual_tcp_pose())
+  return p_rel[0]
+end
+
+def y_im_frame(frame):
+  local p_rel = pose_trans(pose_inv(frame), get_actual_tcp_pose())
+  return p_rel[1]
+end
+
+def z_im_frame(frame):
+  local p_rel = pose_trans(pose_inv(frame), get_actual_tcp_pose())
+  return p_rel[2]
+end
+
+# y-Lage der Reihe nr: bekannte Reihen aus der Liste, weitere im gleichen Abstand dahinter
+def reihen_position(reihen_liste, abstand, nr):
+  local anzahl = get_list_length(reihen_liste)
+  if nr < anzahl:
+    return reihen_liste[nr]
+  end
+  return reihen_liste[anzahl - 1] + (nr - (anzahl - 1)) * abstand
+end
+
+# Kraftgeregelt in z fahren. richtung: +1 = nach unten, -1 = nach oben.
+# Die Kraft steigt stufenweise von kraft_start bis kraft_max.
+# Rueckgabe: 0 = Ziel erreicht, 2 = nicht erreicht, 5 = Notgrenze 100 N
+def kraft_fahren_z(frame, richtung, kraft_start, kraft_max, kraft_schritt, ziel_z, toleranz, zeit_pro_stufe):
+  local kraft = kraft_start
+  local zeit = 0.0
+  local z = 0.0
+  local erreicht = False
+  sleep(0.1)
+  while kraft <= kraft_max + 0.001 and erreicht == False:
+    force_mode(frame, [0, 0, 1, 0, 0, 0], [0, 0, richtung * kraft, 0, 0, 0], 2, [0.02, 0.02, 0.05, 0.1, 0.1, 0.1])
+    zeit = 0.0
+    while zeit < zeit_pro_stufe and erreicht == False:
+      sleep(0.02)
+      zeit = zeit + 0.02
+      if force() > 100.0:
+        end_force_mode()
+        stopl(2.0)
+        return 5
+      end
+      z = z_im_frame(frame)
+      if richtung * (z - ziel_z) >= (0.0 - toleranz):
+        erreicht = True
+      end
+    end
+    kraft = kraft + kraft_schritt
+  end
+  end_force_mode()
+  sleep(0.1)
+  if erreicht:
+    return 0
+  end
+  return 2
+end
+
+# Mit zugkraft nach oben ziehen. Bleibt das Teil unten, sitzt es fest.
+def sitzt_teil_fest(frame, einrast_z, zugkraft):
+  local z = 0.0
+  sleep(0.1)
+  force_mode(frame, [0, 0, 1, 0, 0, 0], [0, 0, 0.0 - zugkraft, 0, 0, 0], 2, [0.02, 0.02, 0.01, 0.1, 0.1, 0.1])
+  sleep(0.6)
+  z = z_im_frame(frame)
+  end_force_mode()
+  sleep(0.1)
+  if z < einrast_z - 0.0015:
+    return False
+  end
+  return True
+end
+
+# Seitlich mit 8 N tasten. richtung: +1 = nach rechts, -1 = nach links.
+# Rueckgabe: x der Werkzeugspitze beim Kontakt, -9.0 = keine Kante gefunden
+def kante_antasten(frame, richtung, max_weg):
+  local x_anfang = 0.0
+  local x_vorher = 0.0
+  local x = 0.0
+  local zeit = 0.0
+  local zeit_max = max_weg / 0.01 + 2.0
+  zero_ftsensor()
+  sleep(0.1)
+  x_anfang = x_im_frame(frame)
+  x_vorher = x_anfang
+  force_mode(frame, [1, 0, 0, 0, 0, 0], [richtung * 8.0, 0, 0, 0, 0, 0], 2, [0.01, 0.005, 0.005, 0.05, 0.05, 0.05])
+  sleep(0.3)
+  while zeit < zeit_max:
+    sleep(0.1)
+    zeit = zeit + 0.1
+    x = x_im_frame(frame)
+    if richtung * (x - x_anfang) > max_weg:
+      end_force_mode()
+      return -9.0
+    end
+    if norm(x - x_vorher) < 0.0002:
+      end_force_mode()
+      sleep(0.1)
+      return x
+    end
+    x_vorher = x
+  end
+  end_force_mode()
+  return -9.0
+end
+
+# Gemessene Fingerposition mit der Liste vergleichen.
+# Rueckgabe: Typnummer, -1 = kein Typ passt
+def typ_finden(finger_liste, gemessen, toleranz):
+  local i = 0
+  local anzahl = get_list_length(finger_liste)
+  while i < anzahl:
+    if norm(finger_liste[i] - gemessen) <= toleranz:
+      return i
+    end
+    i = i + 1
+  end
+  return -1
+end
