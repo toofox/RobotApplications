@@ -1,0 +1,511 @@
+# =====================================================================
+#  Pick and Place Version 6 - Schalter aus Magazinen in den Schaltschrank
+#  UR10e / PolyScope 5. Wird im BeforeStart als Script-Datei geladen.
+# =====================================================================
+#
+#  VORHER IN POLYSCOPE ANLEGEN
+#  ---------------------------
+#  1) Installation > Features > Ebene "Schrank" (Haken "Variable" setzen):
+#     x-Achse entlang der Schienen nach RECHTS (sonst X_NACH_RECHTS = -1)
+#  2) Installation > TCP: Mitte zwischen den Fingerspitzen, Nutzlast setzen
+#  3) Installation > Allgemein > Variablen (bleiben nach Neustart erhalten):
+#     zwischen_pose   = p[0,0,0,0,0,0]
+#     anz_mag         = 0
+#     anz_schienen    = 0
+#     mag_greif       = [p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0]]
+#     mag_auf         = [0.0,0.0,0.0,0.0,0.0,0.0]
+#     mag_dx          = [0.0,0.0,0.0,0.0,0.0,0.0]
+#     mag_dy          = [0.0,0.0,0.0,0.0,0.0,0.0]
+#     mag_b           = [0.0,0.0,0.0,0.0,0.0,0.0]
+#     mag_kap         = [0,0,0,0,0,0]
+#     mag_entnommen   = [0,0,0,0,0,0]
+#     schiene_start   = [p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0],p[0,0,0,0,0,0]]
+#     schiene_laenge  = [0.0,0.0,0.0,0.0,0.0,0.0]
+#     schiene_ref_b   = [0.0,0.0,0.0,0.0,0.0,0.0]
+#     schiene_letzt_x = [0.0,0.0,0.0,0.0,0.0,0.0]
+#     schiene_anzahl  = [0,0,0,0,0,0]
+# =====================================================================
+
+# ---------- Einstellungen (am Roboter langsam testen und anpassen) ----------
+GREIFER_MAX_MM = 50.0     # ganz offen beim Einlernen
+AUF_RESERVE_MM = 6.0      # so viel weiter oeffnen als die gemessene Schalterbreite
+ANFAHR = 0.05             # Anfahr-/Abhebeweg entlang Werkzeug-z [m]
+A_J = 1.0
+V_J = 0.8
+A_L = 0.5
+V_L = 0.15
+V_LANGSAM = 0.02
+
+X_NACH_RECHTS = 1         # +1 wenn die x-Achse von "Schrank" nach rechts zeigt
+SUCH_HOEHE = 0.008        # beim Antasten so weit ueber Einbauhoehe [m]
+SUCH_VORLAUF = 0.07       # Suche startet so weit rechts vom letzten Schalter [m]
+SPIEL = 0.0003            # Luft zum Nachbarschalter [m]
+
+KIPP_WINKEL = d2r(12)     # Schraeglage beim Einhaken (Vorzeichen testen!)
+HAKEN_Y = 0.0175          # Drehpunkt = Hakenkante, Abstand vom TCP in Schrank-y [m]
+HAKEN_Z = 0.0             # Drehpunkt, Abstand vom TCP in Schrank-z [m]
+DREH_SCHRITTE = 6
+DRUCK_DREHEN = 8.0        # leichter Andruck beim Abklappen [N]
+VERSUCHE = 2              # Einsetzversuche pro Schalter
+ZUGKRAFT = 15.0           # Pruefzug nach dem Einrasten [N]
+
+# ---------- Auftrag (wird bei jedem Start neu eingegeben) ----------
+MAX_ZEILEN = 20
+a_n = 0
+a_schiene = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+a_mag     = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+a_anz     = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+
+# =====================================================================
+#  GREIFER - nur diese drei Funktionen an euren Greifer anpassen
+#  (Beispiel: Robotiq Hand-E / 2F-85 mit Robotiq-URCap)
+# =====================================================================
+def greifer_auf(breite_mm):
+  rq_move_and_wait_mm(breite_mm)
+end
+
+# schliessen; Rueckgabe True = Teil gegriffen
+def greifer_zu():
+  rq_close_and_wait()
+  return rq_is_object_detected()
+end
+
+# aktuelle Oeffnung in mm
+def greifer_breite():
+  return rq_current_pos_mm()
+end
+
+# =====================================================================
+#  Hilfsfunktionen
+# =====================================================================
+def meldung(text):
+  local x = request_boolean_from_primary_client(text)
+end
+
+def x_im_frame(frame):
+  local p_rel = pose_trans(pose_inv(frame), get_actual_tcp_pose())
+  return p_rel[0]
+end
+
+def z_im_frame(frame):
+  local p_rel = pose_trans(pose_inv(frame), get_actual_tcp_pose())
+  return p_rel[2]
+end
+
+# x einer Pose im Feature Schrank
+def x_von(pose_w):
+  local rel = pose_trans(pose_inv(Schrank), pose_w)
+  return rel[0]
+end
+
+# gleiche Pose, nur x (im Schrank) ersetzt
+def x_setzen(pose_w, x_neu):
+  local rel = pose_trans(pose_inv(Schrank), pose_w)
+  local neu = p[x_neu, rel[1], rel[2], rel[3], rel[4], rel[5]]
+  return pose_trans(Schrank, neu)
+end
+
+# Entlang Werkzeug-z vom Teil weg fahren
+def hochfahren():
+  movel(pose_trans(get_actual_tcp_pose(), p[0, 0, 0.0 - ANFAHR, 0, 0, 0]), a=A_L, v=V_L)
+end
+
+# Zielpose um die Hakenkante gekippt (Drehachse parallel zur Schiene = Schrank-x)
+def gekippt(p_ziel, winkel):
+  local rel = pose_trans(pose_inv(Schrank), p_ziel)
+  local drehpunkt = p[rel[0], rel[1] + HAKEN_Y, rel[2] + HAKEN_Z, 0, 0, 0]
+  local dreh = p[0, 0, 0, winkel, 0, 0]
+  local rel_neu = pose_trans(drehpunkt, pose_trans(dreh, pose_trans(pose_inv(drehpunkt), rel)))
+  return pose_trans(Schrank, rel_neu)
+end
+
+# Kraftgeregelt in z des Frames fahren (+1 = Richtung Teil). 0 = erreicht, 2 = nicht, 5 = >100 N
+def kraft_fahren_z(frame, richtung, kraft_start, kraft_max, kraft_schritt, ziel_z, toleranz, zeit_pro_stufe):
+  local kraft = kraft_start
+  local zeit = 0.0
+  local z = 0.0
+  local erreicht = False
+  sleep(0.1)
+  while kraft <= kraft_max + 0.001 and erreicht == False:
+    force_mode(frame, [0, 0, 1, 0, 0, 0], [0, 0, richtung * kraft, 0, 0, 0], 2, [0.02, 0.02, 0.05, 0.1, 0.1, 0.1])
+    zeit = 0.0
+    while zeit < zeit_pro_stufe and erreicht == False:
+      sleep(0.02)
+      zeit = zeit + 0.02
+      if force() > 100.0:
+        end_force_mode()
+        stopl(2.0)
+        return 5
+      end
+      z = z_im_frame(frame)
+      if richtung * (z - ziel_z) >= (0.0 - toleranz):
+        erreicht = True
+      end
+    end
+    kraft = kraft + kraft_schritt
+  end
+  end_force_mode()
+  sleep(0.1)
+  if erreicht:
+    return 0
+  end
+  return 2
+end
+
+# Nach oben ziehen: bleibt das Teil unten, ist es eingerastet
+def sitzt_teil_fest(frame, einrast_z, zugkraft):
+  local z = 0.0
+  sleep(0.1)
+  force_mode(frame, [0, 0, 1, 0, 0, 0], [0, 0, 0.0 - zugkraft, 0, 0, 0], 2, [0.02, 0.02, 0.01, 0.1, 0.1, 0.1])
+  sleep(0.6)
+  z = z_im_frame(frame)
+  end_force_mode()
+  sleep(0.1)
+  if z < einrast_z - 0.0015:
+    return False
+  end
+  return True
+end
+
+# Seitlich mit 8 N tasten. Rueckgabe: x beim Kontakt, -9.0 = keine Kante
+def kante_antasten(frame, richtung, max_weg):
+  local x_anfang = 0.0
+  local x_vorher = 0.0
+  local x = 0.0
+  local zeit = 0.0
+  local zeit_max = max_weg / 0.01 + 2.0
+  zero_ftsensor()
+  sleep(0.1)
+  x_anfang = x_im_frame(frame)
+  x_vorher = x_anfang
+  force_mode(frame, [1, 0, 0, 0, 0, 0], [richtung * 8.0, 0, 0, 0, 0, 0], 2, [0.01, 0.005, 0.005, 0.05, 0.05, 0.05])
+  sleep(0.3)
+  while zeit < zeit_max:
+    sleep(0.1)
+    zeit = zeit + 0.1
+    x = x_im_frame(frame)
+    if richtung * (x - x_anfang) > max_weg:
+      end_force_mode()
+      return -9.0
+    end
+    if norm(x - x_vorher) < 0.0002:
+      end_force_mode()
+      sleep(0.1)
+      return x
+    end
+    x_vorher = x
+  end
+  end_force_mode()
+  return -9.0
+end
+
+# =====================================================================
+#  EINLERNEN (Freedrive)
+# =====================================================================
+def magazine_einlernen():
+  global zwischen_pose, anz_mag, mag_greif, mag_auf, mag_dx, mag_dy, mag_b, mag_kap, mag_entnommen
+  local m = 0
+  local b = 0.0
+  local ok = False
+  local p_test = p[0, 0, 0, 0, 0, 0]
+
+  # sicherer Zwischenpunkt ueber dem Tisch
+  freedrive_mode()
+  ok = request_boolean_from_primary_client("Freedrive: Roboter an einen SICHEREN Punkt hoch ueber dem Tisch fuehren (zwischen Magazinen und Schrank). Dann OK.")
+  end_freedrive_mode()
+  zwischen_pose = get_actual_tcp_pose()
+
+  anz_mag = request_integer_from_primary_client("Wie viele Magazine? (1-6)")
+  if anz_mag < 1 or anz_mag > 6:
+    meldung("Ungueltige Anzahl. Bitte neu starten.")
+    anz_mag = 0
+    return
+  end
+
+  while m < anz_mag:
+    # 1. Greifposition + Oeffnung am ersten Schalter
+    greifer_auf(GREIFER_MAX_MM)
+    freedrive_mode()
+    ok = request_boolean_from_primary_client(str_cat(str_cat("Magazin ", m + 1), ": Greifer mit offenen Fingern um den ERSTEN Schalter fuehren (richtige Greifhoehe). OK = Greifer schliesst."))
+    end_freedrive_mode()
+    sleep(0.3)
+    mag_greif[m] = get_actual_tcp_pose()
+    ok = greifer_zu()
+    b = greifer_breite()
+    mag_auf[m] = b + AUF_RESERVE_MM
+    greifer_auf(mag_auf[m])
+    movel(pose_trans(mag_greif[m], p[0, 0, 0.0 - ANFAHR, 0, 0, 0]), a=A_L, v=V_LANGSAM)
+
+    # 2. Daten von Hand
+    mag_kap[m] = request_integer_from_primary_client(str_cat(str_cat("Wie viele Schalter sind in Magazin ", m + 1), "?"))
+    mag_b[m] = request_float_from_primary_client("Breite eines Schalters entlang der Schiene [mm]?")
+
+    # 3. Versatz zum naechsten Schalter von Hand + Kontrollfahrt
+    ok = False
+    while ok == False:
+      mag_dx[m] = request_float_from_primary_client("Versatz zum naechsten Schalter in Werkzeug-X [mm] (mit Vorzeichen)") / 1000.0
+      mag_dy[m] = request_float_from_primary_client("Versatz zum naechsten Schalter in Werkzeug-Y [mm] (mit Vorzeichen)") / 1000.0
+      if mag_kap[m] > 1:
+        p_test = pose_trans(mag_greif[m], p[mag_dx[m], mag_dy[m], -0.01, 0, 0, 0])
+        movel(pose_trans(p_test, p[0, 0, 0.0 - ANFAHR, 0, 0, 0]), a=A_L, v=V_L)
+        movel(p_test, a=A_L, v=V_LANGSAM)
+        ok = request_boolean_from_primary_client("Steht der Greifer 10 mm ueber dem ZWEITEN Schalter? Ja = weiter, Nein = Versatz neu eingeben")
+        hochfahren()
+      else:
+        ok = True
+      end
+    end
+    mag_entnommen[m] = 0
+    m = m + 1
+  end
+  movej(zwischen_pose, a=A_J, v=V_J)
+  meldung("Magazine eingelernt.")
+end
+
+def schienen_einlernen():
+  global anz_schienen, schiene_start, schiene_laenge, schiene_ref_b, schiene_letzt_x, schiene_anzahl
+  local s = 0
+  local m_ref = 0
+  local ok = False
+
+  if anz_mag < 1:
+    meldung("Zuerst die Magazine einlernen (Modus 1).")
+    return
+  end
+  anz_schienen = request_integer_from_primary_client("Wie viele Schienen? (1-6)")
+  if anz_schienen < 1 or anz_schienen > 6:
+    meldung("Ungueltige Anzahl. Bitte neu starten.")
+    anz_schienen = 0
+    return
+  end
+
+  while s < anz_schienen:
+    m_ref = request_integer_from_primary_client(str_cat(str_cat("Schiene ", s + 1), ": mit einem Schalter aus welchem Magazin lernen?")) - 1
+    if m_ref < 0 or m_ref >= anz_mag:
+      m_ref = 0
+    end
+    greifer_auf(mag_auf[m_ref])
+    ok = request_boolean_from_primary_client("Schalter zwischen die Finger halten. OK = Greifer schliesst.")
+    ok = greifer_zu()
+
+    freedrive_mode()
+    ok = request_boolean_from_primary_client(str_cat(str_cat("Schiene ", s + 1), ": Schalter an die ERSTE Einbauposition (ganz links) fuehren und einrasten. Dann OK."))
+    end_freedrive_mode()
+    sleep(0.3)
+    schiene_start[s] = get_actual_tcp_pose()
+    schiene_ref_b[s] = mag_b[m_ref]
+    greifer_auf(mag_auf[m_ref])
+    hochfahren()
+
+    schiene_laenge[s] = request_float_from_primary_client("Nutzbare Laenge der Schiene ab dieser Position [mm]?") / 1000.0
+    schiene_anzahl[s] = 0
+    schiene_letzt_x[s] = 0.0
+    meldung("Den Lern-Schalter wieder von der Schiene nehmen. Dann OK.")
+    s = s + 1
+  end
+  movej(zwischen_pose, a=A_J, v=V_J)
+  meldung("Schienen eingelernt.")
+end
+
+# Neue Runde: Magazine wieder voll, Schrank leer
+def zaehler_zuruecksetzen():
+  global mag_entnommen, schiene_anzahl, schiene_letzt_x
+  local i = 0
+  while i < 6:
+    mag_entnommen[i] = 0
+    schiene_anzahl[i] = 0
+    schiene_letzt_x[i] = 0.0
+    i = i + 1
+  end
+  meldung("Zaehler zurueckgesetzt.")
+end
+
+# =====================================================================
+#  AUFTRAG (Plan vom Professor)
+# =====================================================================
+def auftrag_eingeben():
+  global a_n, a_schiene, a_mag, a_anz
+  local s = 0
+  local m = 0
+  local k = 0
+  local fertig = False
+  local ok = True
+  local bedarf = [0, 0, 0, 0, 0, 0]
+  a_n = 0
+  while fertig == False and a_n < MAX_ZEILEN:
+    s = request_integer_from_primary_client(str_cat(str_cat("Zeile ", a_n + 1), ": Schiene Nr.? (0 = Eingabe fertig)"))
+    if s == 0:
+      fertig = True
+    else:
+      m = request_integer_from_primary_client("Aus Magazin Nr.?")
+      k = request_integer_from_primary_client("Wie viele Schalter?")
+      if s < 1 or s > anz_schienen or m < 1 or m > anz_mag or k < 1:
+        meldung("Ungueltige Eingabe - diese Zeile bitte neu eingeben.")
+      else:
+        a_schiene[a_n] = s - 1
+        a_mag[a_n] = m - 1
+        a_anz[a_n] = k
+        bedarf[m - 1] = bedarf[m - 1] + k
+        a_n = a_n + 1
+      end
+    end
+  end
+  # reicht der Inhalt der Magazine?
+  m = 0
+  while m < anz_mag:
+    if bedarf[m] > mag_kap[m] - mag_entnommen[m]:
+      ok = request_boolean_from_primary_client(str_cat(str_cat("Magazin ", m + 1), " hat zu wenig Schalter. Trotzdem starten?"))
+      if ok == False:
+        a_n = 0
+      end
+    end
+    m = m + 1
+  end
+end
+
+# naechsten vollen Platz im Magazin m greifen. 0 = ok, 3 = Magazin leer
+def teil_holen(m):
+  global mag_entnommen
+  local k = 0
+  local p_g = p[0, 0, 0, 0, 0, 0]
+  local p_ueber = p[0, 0, 0, 0, 0, 0]
+  local da = False
+  while mag_entnommen[m] < mag_kap[m]:
+    k = mag_entnommen[m]
+    # Position k = erster Schalter + k * Versatz (im Werkzeugsystem -> geht auch bei schraegem Magazin)
+    p_g = pose_trans(mag_greif[m], p[k * mag_dx[m], k * mag_dy[m], 0, 0, 0, 0])
+    p_ueber = pose_trans(p_g, p[0, 0, 0.0 - ANFAHR, 0, 0, 0])
+    greifer_auf(mag_auf[m])
+    movej(p_ueber, a=A_J, v=V_J)
+    movel(p_g, a=A_L, v=V_LANGSAM)
+    da = greifer_zu()
+    mag_entnommen[m] = k + 1
+    movel(p_ueber, a=A_L, v=V_L)
+    if da:
+      return 0
+    end
+    # Platz war leer -> naechsten probieren
+  end
+  return 3
+end
+
+# Einhaken, abklappen, einrasten, pruefen. 0 = sitzt, 1 = nicht eingerastet, 5 = Kraftgrenze
+def einrasten(p_ziel):
+  local p_kipp = gekippt(p_ziel, KIPP_WINKEL)
+  local erg = 0
+  local i = 1.0
+  local w = 0.0
+  movej(pose_trans(p_kipp, p[0, 0, 0.0 - ANFAHR, 0, 0, 0]), a=A_J, v=V_J)
+  zero_ftsensor()
+  # 1. gekippt absenken, bis die eine Seite einhakt
+  erg = kraft_fahren_z(p_kipp, 1, 10.0, 25.0, 5.0, 0.0, 0.0008, 0.4)
+  if erg == 5:
+    return 5
+  end
+  # 2. um die Hakenkante abklappen, mit leichtem Andruck
+  force_mode(p_ziel, [0, 0, 1, 0, 0, 0], [0, 0, DRUCK_DREHEN, 0, 0, 0], 2, [0.02, 0.02, 0.02, 0.1, 0.1, 0.1])
+  while i <= DREH_SCHRITTE:
+    w = KIPP_WINKEL * (1.0 - i / DREH_SCHRITTE)
+    movel(gekippt(p_ziel, w), a=0.3, v=V_LANGSAM)
+    i = i + 1.0
+  end
+  end_force_mode()
+  # 3. andere Seite einrasten
+  erg = kraft_fahren_z(p_ziel, 1, 20.0, 60.0, 10.0, 0.0, 0.0005, 0.5)
+  if erg == 5:
+    return 5
+  end
+  # 4. Zugprobe
+  if erg == 0:
+    if sitzt_teil_fest(p_ziel, 0.0, ZUGKRAFT):
+      return 0
+    end
+  end
+  hochfahren()
+  return 1
+end
+
+# gegriffenen Schalter auf Schiene s setzen. 0 = ok, 1 = nicht eingerastet, 2 = Schiene voll, 3 = keine Kante, 5 = Kraftgrenze
+def teil_einsetzen(s, m):
+  global schiene_anzahl, schiene_letzt_x
+  local x_start = x_von(schiene_start[s])
+  local x_soll = 0.0
+  local x_k = 0.0
+  local p_such = p[0, 0, 0, 0, 0, 0]
+  local p_ziel = p[0, 0, 0, 0, 0, 0]
+  local erg = 1
+  local versuch = 0
+  while versuch < VERSUCHE and erg != 0:
+    if schiene_anzahl[s] == 0:
+      # erster Schalter: gelernte Startposition, Breitenunterschied ausgleichen
+      x_soll = x_start + X_NACH_RECHTS * (mag_b[m] - schiene_ref_b[s]) / 2000.0
+    else:
+      # weitere Schalter: rechts daneben absenken, dann nach links tasten bis Kontakt
+      p_such = pose_trans(x_setzen(schiene_start[s], schiene_letzt_x[s] + X_NACH_RECHTS * SUCH_VORLAUF), p[0, 0, 0.0 - SUCH_HOEHE, 0, 0, 0])
+      movej(pose_trans(p_such, p[0, 0, 0.0 - ANFAHR, 0, 0, 0]), a=A_J, v=V_J)
+      movel(p_such, a=A_L, v=V_LANGSAM)
+      x_k = kante_antasten(Schrank, 0 - X_NACH_RECHTS, SUCH_VORLAUF + 0.01)
+      hochfahren()
+      if x_k == -9.0:
+        return 3
+      end
+      x_soll = x_k + X_NACH_RECHTS * SPIEL
+    end
+    if X_NACH_RECHTS * (x_soll - x_start) > schiene_laenge[s]:
+      return 2
+    end
+    p_ziel = x_setzen(schiene_start[s], x_soll)
+    erg = einrasten(p_ziel)
+    if erg == 5:
+      return 5
+    end
+    versuch = versuch + 1
+  end
+  if erg != 0:
+    return 1
+  end
+  greifer_auf(mag_auf[m])
+  hochfahren()
+  schiene_anzahl[s] = schiene_anzahl[s] + 1
+  schiene_letzt_x[s] = x_soll
+  return 0
+end
+
+def fehler(text):
+  movej(zwischen_pose, a=A_J, v=V_J)
+  return request_boolean_from_primary_client(str_cat(text, " Ja = weitermachen, Nein = Auftrag abbrechen"))
+end
+
+# ganzen Auftrag abarbeiten. 0 = fertig, 1 = abgebrochen
+def auftrag_ausfuehren():
+  local i = 0
+  local k = 0
+  local erg = 0
+  local weiter = True
+  while i < a_n and weiter:
+    k = 0
+    while k < a_anz[i] and weiter:
+      movej(zwischen_pose, a=A_J, v=V_J)
+      erg = teil_holen(a_mag[i])
+      if erg != 0:
+        weiter = fehler(str_cat(str_cat("Magazin ", a_mag[i] + 1), " ist leer. Rest dieser Zeile wird ausgelassen."))
+        k = a_anz[i]
+      else:
+        movej(zwischen_pose, a=A_J, v=V_J)
+        erg = teil_einsetzen(a_schiene[i], a_mag[i])
+        if erg != 0:
+          weiter = fehler(str_cat(str_cat(str_cat("Einsetzen auf Schiene ", a_schiene[i] + 1), " fehlgeschlagen, Code "), erg))
+          meldung("Schalter aus dem Greifer nehmen. OK = Greifer oeffnet.")
+          greifer_auf(GREIFER_MAX_MM)
+        end
+        k = k + 1
+      end
+    end
+    i = i + 1
+  end
+  movej(zwischen_pose, a=A_J, v=V_J)
+  if weiter:
+    return 0
+  end
+  return 1
+end
